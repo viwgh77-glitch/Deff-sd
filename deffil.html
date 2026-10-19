@@ -1,0 +1,1209 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>WHITE HOOK — ACT 2</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; touch-action:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+  html,body { width:100%; height:100%; background:#000; overflow:hidden; font-family:monospace; }
+  #cv { position:fixed; left:0; top:0; z-index:0; }
+  #hand { position:fixed; left:0; top:0; width:100vw; height:100vh; pointer-events:none; z-index:1000; will-change:transform; }
+  .enemy-img { position:fixed; left:0; top:0; pointer-events:none; z-index:100; display:none; will-change:transform,width,height,filter; transform-origin:0 0; }
+  .btn {
+    position:absolute; bottom:24px; z-index:2000;
+    width:84px; height:84px; border-radius:50%;
+    background:rgba(40,20,50,0.4); border:2px solid rgba(110,70,130,0.7);
+    color:#b0a0c0; font-size:12px; font-weight:bold; letter-spacing:1px;
+    display:flex; align-items:center; justify-content:center;
+    text-shadow:0 0 5px rgba(80,40,100,0.8);
+    backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px);
+  }
+  .btn.lite { backdrop-filter:none; -webkit-backdrop-filter:none; background:rgba(40,20,50,0.6); }
+  .btn:active { background:rgba(110,70,130,0.6); transform:scale(0.92); }
+  #hook { right:20px; bottom:130px; }
+  #dash { right:130px; bottom:130px; }
+  #fist { right:130px; bottom:24px; }
+  #hint { position:absolute; top:10px; left:50%; transform:translateX(-50%); color:#a090b0; font-size:11px; opacity:0.6; pointer-events:none; letter-spacing:1px; z-index:2000; text-align:center; }
+  body.pc .btn { display:none; }
+  body.pc #hint { display:none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<img id="hand" src="ruka.gif" alt="">
+<div id="hint">СВАЙП ←→ ПОВОРОТ • СВАЙП ↑↓ ВЗГЛЯД • ДЖОЙСТИК СЛЕВА ХОДЬБА</div>
+<div class="btn" id="hook">КРЮК</div>
+<div class="btn" id="dash">РЫВОК</div>
+<div class="btn" id="fist">РУКА</div>
+
+<script>
+"use strict";
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const handEl = document.getElementById('hand');
+let W, H;
+
+// --- Определяем ПК и слабое устройство ---
+const isPC = !('ontouchstart' in window) && matchMedia('(pointer:fine)').matches;
+const isWeak = (navigator.hardwareConcurrency || 4) <= 4;
+if (isPC) document.body.classList.add('pc');
+if (isWeak) document.querySelectorAll('.btn').forEach(b => b.classList.add('lite'));
+
+function resize(){
+  W = window.innerWidth;
+  H = window.innerHeight;
+  // Ограничиваем DPR на телефоне — экономия GPU без визуальной потери
+  const dpr = isPC ? Math.min(devicePixelRatio || 1, 2) : Math.min(devicePixelRatio || 1, 2);
+  cv.width  = Math.floor(W * dpr);
+  cv.height = Math.floor(H * dpr);
+  cv.style.width  = W + 'px';
+  cv.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize, {passive:true});
+resize();
+
+// ============ Мир (константы без изменений) ============
+const WALL_H_STD   = 2.4;
+const WALL_H_TALL  = 8.0;
+const EYE_H  = 1.65;
+const ENEMY_HEIGHT = 1.8;
+const ENEMY_HEIGHT_2 = 2.1;
+const ANT_HEIGHT = 3.6;
+const ENEMY_ATTACK_DURATION = 1.0;
+const HAND_ACTION_DURATION = 1.0;
+const PLAYER_MELEE_RANGE = 3.5;
+const ENEMY_ATTACK_RANGE = 1.6;
+const ENEMY_HIT_TOLERANCE = 0.4;
+const ENEMY_DAMAGE = 10;
+
+const DASH_DURATION = 0.35;
+const DASH_TELEPORT_DISTANCE = 3.0;
+const HAND_KICK_MAX = 55;
+
+const HOOK_AIM_DOT = 0.95;
+const HOOK_RANGE   = 10;
+const FOV = Math.PI/3;
+
+const ANT_DURATION = 30.0;
+const ANT_COOLDOWN_MAX = 30.0;
+
+const BOSS_MAX_HP = 500;
+const BOSS_BALL_DAMAGE_TO_BOSS = 25;
+const BOSS_BALL_DAMAGE_TO_PLAYER = 15;
+const BOSS_SHOOT_INTERVAL = 2.0;
+const BOSS_TELEPORT_MIN = 3.0;
+const BOSS_TELEPORT_MAX = 10.0;
+const BOSS_BALL_SPEED = 5.0;
+const BOSS_BOTTOM = 0.2;
+const BOSS_TOP    = 7.5;
+const BOSS_ASPECT = 0.9;
+const BOSS_ROOM_Y = 13.0;
+
+// Шаг рейкаста: чуть крупнее на телефоне (визуально неотличимо)
+const RAY_STEP = isWeak ? 0.035 : 0.025;
+const LOS_STEP = isWeak ? 0.15  : 0.1;
+
+let pitchPixels = 0;
+function updatePitchMax(){ return H * 0.4; }
+
+function getWallHeight(cell){
+  if (cell === 4) return WALL_H_TALL;
+  return WALL_H_STD;
+}
+function getSection(y){
+  if (y < 5)  return 'top';
+  if (y >= 13) return 'boss';
+  if (y >= 8) return 'bottom';
+  return null;
+}
+
+const player = {
+  x: 7.5, y: 6.5, dir: -Math.PI/2,
+  dashTimer: 0, dashSpeed: 12.0, dashAnim: 0,
+  handKick: 0, fistAnim: 0, hookAnim: 0, hookTarget: null,
+  hp: 1000, maxHp: 1000,
+  bob: 0, moving: 0,
+  gainText: '', gainTextTimer: 0,
+  shake: 0,
+};
+
+// ============ Союзник ============
+const ant = { active:false, cooldown:0, timer:0, x:0, y:0, attackAnim:0, attackCd:0, facing:0 };
+const antEl = document.createElement('img');
+antEl.className = 'enemy-img';
+antEl.style.display = 'none';
+document.body.appendChild(antEl);
+
+// ============ Карта ============
+let map = [
+  [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,1,0,0,0,0,0,0,1,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1],
+  [1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1],
+  [1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,0,1,1,1,1,0,0,0,0,0,1],
+  [1,0,0,0,0,0,1,1,1,1,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [4,4,4,4,3,3,4,4,4,4,4,4,4,4,4,4],
+  [4,4,4,0,0,0,0,0,0,0,0,0,0,4,4,4],
+  [4,4,4,0,0,0,0,0,0,0,0,0,0,4,4,4],
+  [4,4,4,0,0,0,0,0,0,0,0,0,0,4,4,4],
+  [4,4,4,0,0,0,0,0,0,0,0,0,0,4,4,4],
+  [4,4,4,0,0,0,0,0,0,0,0,0,0,4,4,4],
+  [4,4,4,0,0,0,0,0,0,0,0,0,0,4,4,4],
+  [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],
+];
+let MAP_W = map[0].length, MAP_H = map.length;
+
+let act2 = false;
+let transitionActive = false;
+let transitionTimer = 0;
+
+// ============ Враги ============
+let enemies = [
+  { x: 2.5,  y: 1.5,  hp: 3, alive: true, facing: 0,          atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 },
+  { x: 8.0,  y: 1.5,  hp: 3, alive: true, facing: Math.PI,    atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 },
+  { x: 13.5, y: 1.5,  hp: 3, alive: true, facing: Math.PI,    atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 },
+  { x: 2.5,  y: 9.5,  hp: 3, alive: true, facing: 0,          atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 },
+  { x: 13.5, y: 9.5,  hp: 3, alive: true, facing: Math.PI,    atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 },
+  { x: 7.5,  y: 11.5, hp: 3, alive: true, facing: 0,          atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 },
+];
+let enemyEls = enemies.map(() => {
+  const el = document.createElement('img');
+  el.className = 'enemy-img';
+  el.alt = '';
+  document.body.appendChild(el);
+  return el;
+});
+
+// ============ Босс ============
+const boss = {
+  alive: true, hp: BOSS_MAX_HP,
+  x: 7.5, y: 13.35, wall: 'north',
+  teleportTimer: 5.0, shootTimer: 2.0, hitFlash: 0,
+};
+const BOSS_POSITIONS = {
+  north: { x: 7.5,  y: 13.35 },
+  south: { x: 7.5,  y: 18.65 },
+  west:  { x: 3.35, y: 16.0  },
+  east:  { x: 12.65, y: 16.0 },
+};
+
+const bossEl = document.createElement('img');
+bossEl.className = 'enemy-img';
+bossEl.src = 'function.gif';
+bossEl.style.display = 'none';
+document.body.appendChild(bossEl);
+
+const balls = [];
+for (let i = 0; i < 20; i++) {
+  const el = document.createElement('img');
+  el.className = 'enemy-img';
+  el.src = 'ball.gif';
+  el.style.display = 'none';
+  document.body.appendChild(el);
+  balls.push({ x:0, y:0, vx:0, vy:0, active:false, deflected:false, el });
+}
+
+function spawnBall(x, y, tx, ty) {
+  for (const b of balls) {
+    if (!b.active) {
+      b.x = x; b.y = y;
+      const dx = tx - x, dy = ty - y;
+      const d = Math.hypot(dx, dy) || 1;
+      b.vx = dx/d * BOSS_BALL_SPEED;
+      b.vy = dy/d * BOSS_BALL_SPEED;
+      b.active = true; b.deflected = false;
+      return;
+    }
+  }
+}
+
+let doorOpened = false;
+function checkDoor() {
+  if (doorOpened) return;
+  for (const e of enemies) if (e.alive) return;
+  doorOpened = true;
+  if (act2) { map[1][23] = 0; map[2][23] = 0; }
+  else      { map[12][4] = 0; map[12][5] = 0; }
+  player.shake = Math.max(player.shake, 1.0);
+}
+
+// ============ Предзагрузка + кэш аспектов ============
+let IMG_HAND_IDLE = 'ruka.gif';
+let IMG_HAND_DASH = '';
+let IMG_HAND_ATTACK = 'shelk.gif';
+
+const preloads = {};
+const aspectCache = {};
+['vpered.gif','nazad.gif','levo.gif','pravi.gif','ataka.gif','function.gif','ball.gif','rukabarta.gif','lazer.gif','krol.gif','ruka.gif','shelk.gif','distance.gif','ant.gif','antaka.gif'].forEach(src => {
+  const img = new Image();
+  img.onload = () => { aspectCache[src] = img.naturalWidth / (img.naturalHeight || 1); };
+  img.src = src;
+  preloads[src] = img;
+});
+function getAspect(src){
+  const c = aspectCache[src];
+  if (c) return c;
+  const img = preloads[src];
+  if (img && img.naturalHeight > 0) return img.naturalWidth / img.naturalHeight;
+  return 0.45;
+}
+function isLoaded(src){
+  const img = preloads[src];
+  return img && img.complete && img.naturalWidth > 0;
+}
+
+// ============ Ввод: джойстик/взгляд (телефон) ============
+const joy = { active:false, id:null, baseX:0, baseY:0, x:0, y:0, R:90, r:42, vx:0, vy:0 };
+
+cv.addEventListener('touchstart', e=>{
+  for (const t of e.changedTouches){
+    if (t.clientX < W*0.45 && t.clientY > H*0.25 && !joy.active){
+      joy.active = true; joy.id = t.identifier;
+      joy.baseX = t.clientX; joy.baseY = t.clientY;
+      joy.x = t.clientX; joy.y = t.clientY;
+    }
+  }
+}, {passive:false});
+cv.addEventListener('touchmove', e=>{
+  for (const t of e.changedTouches){
+    if (t.identifier === joy.id){
+      const dx = t.clientX - joy.baseX, dy = t.clientY - joy.baseY;
+      const d = Math.hypot(dx,dy), max = joy.R;
+      if (d > max){ joy.x = joy.baseX + dx/d*max; joy.y = joy.baseY + dy/d*max; }
+      else { joy.x = t.clientX; joy.y = t.clientY; }
+      joy.vx = (joy.x - joy.baseX)/max;
+      joy.vy = (joy.y - joy.baseY)/max;
+    }
+  }
+}, {passive:false});
+cv.addEventListener('touchend', e=>{
+  for (const t of e.changedTouches){
+    if (t.identifier === joy.id){ joy.active=false; joy.id=null; joy.vx=0; joy.vy=0; }
+  }
+}, {passive:false});
+
+let lookId = null, lookX = 0, lookY = 0;
+cv.addEventListener('touchstart', e=>{
+  for (const t of e.changedTouches){
+    if (t.clientX > W*0.45 && lookId === null){
+      lookId = t.identifier; lookX = t.clientX; lookY = t.clientY;
+    }
+  }
+}, {passive:false});
+cv.addEventListener('touchmove', e=>{
+  for (const t of e.changedTouches){
+    if (t.identifier === lookId){
+      const dx = t.clientX - lookX;
+      const dy = t.clientY - lookY;
+      player.dir += dx * 0.006;
+      pitchPixels -= dy * 1.5;
+      const pmax = updatePitchMax();
+      pitchPixels = Math.max(-pmax, Math.min(pmax, pitchPixels));
+      lookX = t.clientX; lookY = t.clientY;
+    }
+  }
+}, {passive:false});
+cv.addEventListener('touchend', e=>{
+  for (const t of e.changedTouches){ if (t.identifier === lookId) lookId = null; }
+}, {passive:false});
+
+// ============ Ввод: ПК ============
+const keys = Object.create(null);
+window.addEventListener('keydown', e=>{
+  // Пробел/стрелки не должны скроллить
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  keys[e.code] = true;
+  if (e.repeat) return;
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') doDash();
+  else if (e.code === 'KeyF') doFist();
+  else if (e.code === 'KeyR') doHook();
+});
+window.addEventListener('keyup', e=>{ keys[e.code] = false; });
+
+cv.addEventListener('wheel', e=>{
+  e.preventDefault();
+  pitchPixels -= e.deltaY * 0.5;
+  const pmax = updatePitchMax();
+  pitchPixels = Math.max(-pmax, Math.min(pmax, pitchPixels));
+}, {passive:false});
+
+// Мышь: поворот при зажатой ЛКМ
+let mouseDown = false;
+cv.addEventListener('mousedown', ()=>{ mouseDown = true; });
+window.addEventListener('mouseup',  ()=>{ mouseDown = false; });
+cv.addEventListener('mousemove', e=>{
+  if (mouseDown) player.dir += e.movementX * 0.005;
+});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+// ============ Кнопки (телефон) и общие обработчики действий ============
+const btns = {
+  hook: document.getElementById('hook'),
+  dash: document.getElementById('dash'),
+  fist: document.getElementById('fist'),
+};
+function onPress(el, fn){
+  el.addEventListener('touchstart', e=>{ e.preventDefault(); e.stopPropagation(); fn(); }, {passive:false});
+  el.addEventListener('mousedown',  e=>{ e.preventDefault(); e.stopPropagation(); fn(); });
+}
+
+function doDash(){
+  if (transitionActive) return;
+  if (act2) {
+    if (player.dashTimer > 0) {
+      player.dashSpeed = 24.0;
+      player.dashTimer = Math.max(player.dashTimer, 0.25);
+      player.dashAnim = 0.35;
+    } else {
+      player.dashSpeed = 12.0;
+      player.dashTimer = 0.25;
+      player.dashAnim = 0.35;
+    }
+    player.handKick = -joy.vx * HAND_KICK_MAX;
+    player.shake = Math.max(player.shake, 0.3);
+    return;
+  }
+  if (player.dashTimer > 0) return;
+  let fwd = -joy.vy, str = joy.vx;
+  // На ПК берём направление из клавиш, если джойстик не активен
+  if (!joy.active && isPC){
+    fwd = (keys['KeyW']||keys['ArrowUp']?1:0) - (keys['KeyS']||keys['ArrowDown']?1:0);
+    str = (keys['KeyD']||keys['ArrowRight']?1:0) - (keys['KeyA']||keys['ArrowLeft']?1:0);
+  }
+  const mag = Math.hypot(fwd, str);
+  let dirX, dirY;
+  if (mag > 0.2){
+    const fx = Math.cos(player.dir), fy = Math.sin(player.dir);
+    const sx = -fy, sy = fx;
+    dirX = (fx*fwd + sx*str) / mag;
+    dirY = (fy*fwd + sy*str) / mag;
+  } else {
+    dirX = Math.cos(player.dir);
+    dirY = Math.sin(player.dir);
+  }
+  const steps = 40;
+  const stepDist = DASH_TELEPORT_DISTANCE / steps;
+  let lastX = player.x, lastY = player.y;
+  for (let i = 1; i <= steps; i++){
+    const tx = player.x + dirX * stepDist * i;
+    const ty = player.y + dirY * stepDist * i;
+    if (isWall(tx, ty)) break;
+    lastX = tx; lastY = ty;
+  }
+  if (Math.hypot(lastX - player.x, lastY - player.y) > 0.1){
+    player.x = lastX; player.y = lastY;
+    player.dashTimer = DASH_DURATION;
+    player.handKick = -joy.vx * HAND_KICK_MAX;
+    player.shake = Math.max(player.shake, 0.3);
+  }
+}
+function doFist(){
+  if (transitionActive) return;
+  if (player.fistAnim <= 0){
+    player.fistAnim = HAND_ACTION_DURATION;
+    punch(); playSnap();
+  }
+}
+function doHook(){
+  if (transitionActive) return;
+  if (act2) {
+    if (!ant.active && ant.cooldown <= 0) {
+      ant.active = true;
+      ant.timer = ANT_DURATION;
+      ant.x = player.x + Math.cos(player.dir) * 1.5;
+      ant.y = player.y + Math.sin(player.dir) * 1.5;
+      ant.attackCd = 2.0;
+      ant.attackAnim = 0;
+      if (isWall(ant.x, ant.y)) { ant.x = player.x; ant.y = player.y; }
+      playSnap();
+    }
+    return;
+  }
+  if (player.hookAnim <= 0){
+    player.hookAnim = HAND_ACTION_DURATION;
+    player.hookTarget = getHookTarget();
+  }
+}
+
+onPress(btns.dash, doDash);
+onPress(btns.fist, doFist);
+onPress(btns.hook, doHook);
+
+function getHookTarget(){
+  let best = null, bestDot = HOOK_AIM_DOT;
+  const fx = Math.cos(player.dir), fy = Math.sin(player.dir);
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const dx = e.x - player.x, dy = e.y - player.y;
+    const d = Math.hypot(dx, dy);
+    if (d > HOOK_RANGE || d < 0.1) continue;
+    const dot = (dx*fx + dy*fy) / d;
+    if (dot > bestDot){ bestDot = dot; best = e; }
+  }
+  return best;
+}
+
+let actx = null;
+function playSnap(){
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    const t = actx.currentTime;
+    for (let i=0;i<2;i++){
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type='square';
+      o.frequency.setValueAtTime(2200 - i*400, t + i*0.02);
+      o.frequency.exponentialRampToValueAtTime(600, t + i*0.02 + 0.03);
+      g.gain.setValueAtTime(0.15, t + i*0.02);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i*0.02 + 0.05);
+      o.connect(g); g.connect(actx.destination);
+      o.start(t + i*0.02); o.stop(t + i*0.02 + 0.06);
+    }
+  } catch(err){}
+}
+
+function hasLineOfSight(x1, y1, x2, y2){
+  const dx = x2 - x1, dy = y2 - y1;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.01) return true;
+  const steps = Math.ceil(dist / LOS_STEP);
+  for (let i = 1; i < steps; i++){
+    const t = i / steps;
+    if (isWall(x1 + dx*t, y1 + dy*t)) return false;
+  }
+  return true;
+}
+
+function isAimingAt(e){
+  const dx = e.x - player.x, dy = e.y - player.y;
+  const dist = Math.hypot(dx, dy);
+  if (!act2 && dist > PLAYER_MELEE_RANGE) return false;
+  if (!hasLineOfSight(player.x, player.y, e.x, e.y)) return false;
+  if (dist < 0.6) return true;
+  let a = Math.atan2(dy, dx) - player.dir;
+  while (a >  Math.PI) a -= 2*Math.PI;
+  while (a < -Math.PI) a += 2*Math.PI;
+  const screenX = W/2 + Math.tan(a) * (W/2) / Math.tan(FOV/2);
+  const projScale = H * 0.9;
+  const eh = act2 ? ENEMY_HEIGHT_2 : ENEMY_HEIGHT;
+  const hpx = (eh / Math.max(0.4, dist)) * projScale;
+  const wpx = hpx * 0.45;
+  return Math.abs(W/2 - screenX) < wpx * 0.55;
+}
+
+function punch(){
+  for (const e of enemies){
+    if (!e.alive) continue;
+    if (!isAimingAt(e)) continue;
+    e.hp--;
+    e.hitFlash = 0.35;
+    if (e.hp <= 0){
+      e.alive = false;
+      const gain = 1 + Math.floor(Math.random() * 200);
+      player.hp = Math.min(player.maxHp, player.hp + gain);
+      player.gainText = '+' + gain;
+      player.gainTextTimer = 1.5;
+    }
+  }
+}
+
+function isWall(x, y){
+  const cx = Math.floor(x), cy = Math.floor(y);
+  if (cx<0||cy<0||cx>=MAP_W||cy>=MAP_H) return true;
+  const c = map[cy][cx];
+  return c === 1 || c === 3 || c === 4;
+}
+
+let last = performance.now();
+function update(dt){
+  if (transitionActive) {
+    transitionTimer -= dt;
+    if (transitionTimer <= 0) { transitionActive = false; startAct2(); }
+    return;
+  }
+
+  // Движение: джойстик или клавиши
+  let fwd = -joy.vy, str = joy.vx;
+  if (!joy.active && isPC){
+    fwd = (keys['KeyW']||keys['ArrowUp']?1:0) - (keys['KeyS']||keys['ArrowDown']?1:0);
+    str = (keys['KeyD']||keys['ArrowRight']?1:0) - (keys['KeyA']||keys['ArrowLeft']?1:0);
+  }
+  const mag = Math.hypot(fwd, str);
+  if (mag > 1){ fwd/=mag; str/=mag; }
+
+  let speed = 3.2;
+  if (act2 && player.dashTimer > 0) {
+    speed = player.dashSpeed;
+    player.dashTimer -= dt;
+    if (player.dashTimer < 0) player.dashTimer = 0;
+  }
+
+  const fx = Math.cos(player.dir), fy = Math.sin(player.dir);
+  const sx = -fy, sy = fx;
+  const nx = player.x + (fx*fwd + sx*str) * speed * dt;
+  const ny = player.y + (fy*fwd + sy*str) * speed * dt;
+  if (!isWall(nx, player.y)) player.x = nx;
+  if (!isWall(player.x, ny)) player.y = ny;
+
+  player.moving = Math.hypot(fwd, str);
+  player.bob += dt * player.moving * 12;
+
+  if (!act2 && player.dashTimer > 0) player.dashTimer -= dt;
+  if (player.dashTimer <= 0 && player.dashSpeed > 0) {
+    player.handKick *= Math.exp(-12 * dt);
+    if (Math.abs(player.handKick) < 0.4) player.handKick = 0;
+  }
+
+  if (player.fistAnim > 0) player.fistAnim -= dt;
+  if (player.dashAnim > 0) player.dashAnim -= dt;
+  if (player.gainTextTimer > 0) player.gainTextTimer -= dt;
+  if (player.shake > 0) player.shake *= Math.exp(-10 * dt);
+
+  if (player.hookAnim > 0){
+    player.hookAnim -= dt;
+    const e = player.hookTarget;
+    if (e && e.alive){
+      const dx = e.x - player.x, dy = e.y - player.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 0.1 && d < HOOK_RANGE){
+        const force = 3.5 * (1 - d/HOOK_RANGE) + 1.5;
+        const nxe = e.x + (dx/d) * force * dt;
+        const nye = e.y + (dy/d) * force * dt;
+        if (!isWall(nxe, e.y)) e.x = nxe;
+        if (!isWall(e.x, nye)) e.y = nye;
+      }
+    }
+    if (player.hookAnim <= 0) player.hookTarget = null;
+  }
+
+  // Союзник
+  if (act2) {
+    if (ant.active) {
+      ant.timer -= dt;
+      if (ant.timer <= 0) {
+        ant.active = false;
+        ant.cooldown = ANT_COOLDOWN_MAX;
+        antEl.style.display = 'none';
+      } else {
+        const adx = player.x - ant.x;
+        const ady = player.y - ant.y;
+        const adist = Math.hypot(adx, ady);
+        if (adist > 4.0) {
+          ant.x += (adx/adist) * 4.0 * dt;
+          ant.y += (ady/adist) * 4.0 * dt;
+          if (!isWall(ant.x, ant.y)) {} else { ant.x -= (adx/adist)*4.0*dt; ant.y -= (ady/adist)*4.0*dt; }
+          ant.facing = Math.atan2(ady, adx);
+        } else if (adist > 0.1 && ant.attackAnim <= 0) {
+          ant.facing = Math.atan2(ady, adx);
+        }
+        if (ant.attackAnim > 0) {
+          ant.attackAnim -= dt;
+        } else {
+          ant.attackCd -= dt;
+          if (ant.attackCd <= 0) {
+            let nearest = null, minD = 999;
+            for (const e of enemies) {
+              if (!e.alive) continue;
+              const distToPlayer = Math.hypot(e.x - player.x, e.y - player.y);
+              if (distToPlayer > 6.0) continue;
+              const d = Math.hypot(e.x - ant.x, e.y - ant.y);
+              if (d < 20 && d < minD) { minD = d; nearest = e; }
+            }
+            if (nearest) {
+              ant.attackAnim = 1.0;
+              ant.attackCd = 4.0;
+              ant.x = nearest.x + (Math.random() - 0.5) * 1.5;
+              ant.y = nearest.y + (Math.random() - 0.5) * 1.5;
+              if (isWall(ant.x, ant.y)) { ant.x = nearest.x; ant.y = nearest.y; }
+              const pdx = nearest.x - player.x;
+              const pdy = nearest.y - player.y;
+              const pd = Math.hypot(pdx, pdy) || 1;
+              nearest.x += (pdx/pd) * 3.0;
+              nearest.y += (pdy/pd) * 3.0;
+            }
+          }
+        }
+      }
+    } else if (ant.cooldown > 0) {
+      ant.cooldown -= dt;
+    }
+  }
+
+  const pSection = getSection(player.y);
+  for (const e of enemies){
+    if (!e.alive) continue;
+    if (e.hitFlash > 0) e.hitFlash -= dt;
+    const eSection = getSection(e.y);
+    if (!act2 && (pSection === null || pSection !== eSection || pSection === 'boss')){
+      e.atkTime = 0; e.didHit = false; continue;
+    }
+    const dx = player.x - e.x, dy = player.y - e.y;
+    const dist = Math.hypot(dx, dy);
+    const angToPlayer = Math.atan2(dy, dx);
+    let diff = angToPlayer - e.facing;
+    while (diff >  Math.PI) diff -= 2*Math.PI;
+    while (diff < -Math.PI) diff += 2*Math.PI;
+    e.facing += diff * Math.min(1, dt * 2.5);
+    if (e.atkCd > 0) e.atkCd -= dt;
+    if (e.atkTime > 0){
+      e.atkTime -= dt;
+      if (!e.didHit && e.atkTime < ENEMY_ATTACK_DURATION * 0.6){
+        const curD = Math.hypot(player.x - e.x, player.y - e.y);
+        if (curD < ENEMY_ATTACK_RANGE + ENEMY_HIT_TOLERANCE){
+          player.hp = Math.max(0, player.hp - ENEMY_DAMAGE);
+        }
+        e.didHit = true;
+      }
+      if (e.atkTime <= 0) e.didHit = false;
+    }
+    if (dist < ENEMY_ATTACK_RANGE && e.atkCd <= 0 && e.atkTime <= 0){
+      e.atkTime = ENEMY_ATTACK_DURATION;
+      e.atkCd = ENEMY_ATTACK_DURATION + 0.8;
+      e.didHit = false;
+    }
+    if (e.atkTime <= 0 && dist > 0.7 && dist < 12){
+      const spd = 0.55;
+      const nxe = e.x + (dx/dist) * spd * dt;
+      const nye = e.y + (dy/dist) * spd * dt;
+      if (!isWall(nxe, e.y)) e.x = nxe;
+      if (!isWall(e.x, nye)) e.y = nye;
+    }
+  }
+
+  checkDoor();
+  if (!act2) { updateBoss(dt); updateBalls(dt); }
+}
+
+function startAct2Transition() {
+  transitionActive = true;
+  transitionTimer = 2.0;
+  if (bossEl.parentNode) bossEl.style.display = 'none';
+  balls.forEach(b => { b.active = false; b.el.style.display = 'none'; });
+  enemyEls.forEach(el => el.style.display = 'none');
+}
+
+function updateBoss(dt){
+  if (!boss.alive) return;
+  if (boss.hitFlash > 0) boss.hitFlash -= dt;
+  if (player.y < BOSS_ROOM_Y) return;
+  boss.teleportTimer -= dt;
+  if (boss.teleportTimer <= 0){
+    teleportBoss();
+    boss.teleportTimer = BOSS_TELEPORT_MIN + Math.random() * (BOSS_TELEPORT_MAX - BOSS_TELEPORT_MIN);
+  }
+  boss.shootTimer -= dt;
+  if (boss.shootTimer <= 0){
+    const distToPlayer = Math.hypot(player.x - boss.x, player.y - boss.y);
+    if (distToPlayer > 2.5){
+      spawnBall(boss.x, boss.y, player.x, player.y);
+      boss.shootTimer = BOSS_SHOOT_INTERVAL;
+    } else {
+      teleportBoss();
+      boss.shootTimer = 1.5;
+    }
+  }
+}
+function teleportBoss(){
+  const walls = ['north', 'south', 'east', 'west'];
+  const others = walls.filter(w => w !== boss.wall);
+  boss.wall = others[Math.floor(Math.random() * others.length)];
+  const pos = BOSS_POSITIONS[boss.wall];
+  boss.x = pos.x; boss.y = pos.y;
+  player.shake = Math.max(player.shake, 0.3);
+}
+function updateBalls(dt){
+  for (const b of balls){
+    if (!b.active) continue;
+    if (player.hookAnim > 0 && !b.deflected){
+      const dx = b.x - player.x, dy = b.y - player.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 6 && d > 0.1){
+        const dot = (dx * Math.cos(player.dir) + dy * Math.sin(player.dir)) / d;
+        if (dot > 0.7){
+          const speed = Math.hypot(b.vx, b.vy);
+          b.vx = (dx/d) * speed; b.vy = (dy/d) * speed;
+          b.deflected = true;
+          player.shake = Math.max(player.shake, 0.15);
+        }
+      }
+    }
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.deflected && boss.alive){
+      const dx = b.x - boss.x, dy = b.y - boss.y;
+      if (Math.hypot(dx, dy) < 1.5){
+        boss.hp -= BOSS_BALL_DAMAGE_TO_BOSS;
+        boss.hitFlash = 0.3;
+        b.active = false;
+        player.shake = Math.max(player.shake, 0.4);
+        if (boss.hp <= 0){ boss.hp = 0; boss.alive = false; startAct2Transition(); }
+        continue;
+      }
+    }
+    if (!b.deflected){
+      const dx = b.x - player.x, dy = b.y - player.y;
+      if (Math.hypot(dx, dy) < 0.5){
+        player.hp = Math.max(0, player.hp - BOSS_BALL_DAMAGE_TO_PLAYER);
+        player.shake = Math.max(player.shake, 0.5);
+        b.active = false; continue;
+      }
+    }
+    if (isWall(b.x, b.y)){
+      b.active = false;
+      player.shake = Math.max(player.shake, 0.25);
+    }
+  }
+}
+
+function startAct2() {
+  act2 = true;
+  doorOpened = false;
+  player.hp = 100;
+  player.maxHp = 100;
+  player.x = 1.5;
+  player.y = 1.5;
+  player.dir = 0;
+  pitchPixels = 0;
+
+  IMG_HAND_IDLE = 'rukabarta.gif';
+  IMG_HAND_ATTACK = 'lazer.gif';
+  IMG_HAND_DASH = 'krol.gif';
+
+  balls.forEach(b => { b.active = false; b.el.style.display = 'none'; });
+
+  const mapStrings = [
+    "111111111111111111111114000000004",
+    "100100000001000000000030000000004",
+    "100000010000000100000030000000004",
+    "111111111111111111111114444444444"
+  ];
+  map = mapStrings.map(row => row.split('').map(Number));
+  MAP_W = map[0].length;
+  MAP_H = map.length;
+
+  enemyEls.forEach(el => el.remove());
+  enemies.length = 0;
+  enemyEls.length = 0;
+
+  const newEnemyPositions = [
+    {x: 4.5, y: 1.5}, {x: 8.5, y: 1.5}, {x: 14.5, y: 1.5},
+    {x: 20.5, y: 1.5}, {x: 26.5, y: 1.5}, {x: 10.5, y: 2.5}, {x: 18.5, y: 2.5}
+  ];
+  newEnemyPositions.forEach(pos => {
+    enemies.push({ x: pos.x, y: pos.y, hp: 3, alive: true, facing: 0, atkCd: 0, atkTime: 0, didHit: false, hitFlash: 0 });
+    const el = document.createElement('img');
+    el.className = 'enemy-img';
+    el.alt = '';
+    document.body.appendChild(el);
+    enemyEls.push(el);
+  });
+
+  if (bossEl.parentNode) bossEl.parentNode.removeChild(bossEl);
+
+  ant.active = false;
+  ant.cooldown = 0;
+  ant.timer = 0;
+  if (antEl.parentNode) antEl.style.display = 'none';
+}
+
+function castRay(px, py, angle){
+  const dx = Math.cos(angle), dy = Math.sin(angle);
+  let dist = 0;
+  while (dist < 30){
+    dist += RAY_STEP;
+    const x = px + dx*dist, y = py + dy*dist;
+    const cx = Math.floor(x), cy = Math.floor(y);
+    if (cx<0||cy<0||cx>=MAP_W||cy>=MAP_H) return { dist, cell:1, side:0 };
+    const c = map[cy][cx];
+    if (c === 1 || c === 3 || c === 4){
+      const fracX = x - Math.floor(x), fracY = y - Math.floor(y);
+      const side = (fracX < 0.02 || fracX > 0.98) ? 1 : 0;
+      return { dist, cell: c, side };
+    }
+  }
+  return { dist: 30, cell: 0, side: 0 };
+}
+
+let handCurrent = 'ruka.gif';
+function updateHand(sx, sy){
+  let src;
+  if (player.fistAnim > 0)      src = IMG_HAND_ATTACK;
+  else if (player.hookAnim > 0) src = 'distance.gif';
+  else if (player.dashAnim > 0 && IMG_HAND_DASH) src = IMG_HAND_DASH;
+  else                          src = IMG_HAND_IDLE;
+  if (handCurrent !== src && isLoaded(src)){
+    handEl.src = src;
+    handCurrent = src;
+  }
+  handEl.style.transform =
+    `translate3d(${(sx||0).toFixed(1)}px, ${(sy||0).toFixed(1)}px, 0) ` +
+    `translateX(${player.handKick.toFixed(1)}px)`;
+}
+
+function drawWallStrip(i, colW, horizon, projScale, hit, corr){
+  const wallH = getWallHeight(hit.cell);
+  const wallHpx = (wallH / Math.max(0.05, corr)) * projScale;
+  const floorY  = horizon + (EYE_H / Math.max(0.05, corr)) * projScale;
+  const topY    = floorY - wallHpx;
+
+  if (hit.cell !== 4) {
+    const ceilingY = topY;
+    const ceilingHeight = 1.0;
+    const ceilHpx = (ceilingHeight / Math.max(0.05, corr)) * projScale;
+    const ceilShade = Math.max(2, 10 - corr * 2);
+    ctx.fillStyle = `rgb(${(ceilShade*1.2)|0},${(ceilShade*0.6)|0},${(ceilShade*1.5)|0})`;
+    ctx.fillRect(i*colW, ceilingY - ceilHpx, colW+1, ceilHpx);
+    if (corr < 15) {
+      ctx.fillStyle = `rgba(80,40,100,${Math.max(0.05, 0.3 - corr*0.02)})`;
+      ctx.fillRect(i*colW, ceilingY - 2, colW+1, 2);
+    }
+  }
+
+  if (hit.cell === 4){
+    const STRIPE_H = 2.0;
+    const numStripes = Math.ceil(wallH / STRIPE_H);
+    for (let s = 0; s < numStripes; s++){
+      const sBot = s * STRIPE_H;
+      const sTop = Math.min(wallH, (s+1) * STRIPE_H);
+      const sBotY = horizon + ((EYE_H - sBot) / Math.max(0.05, corr)) * projScale;
+      const sTopY = horizon + ((EYE_H - sTop) / Math.max(0.05, corr)) * projScale;
+      const stripeH = sBotY - sTopY;
+      const sideMul = hit.side === 1 ? 0.6 : 1.0;
+      const base = (s % 2 === 0) ? 70 : 25;
+      const shade = Math.max(10, base * sideMul - corr * 5);
+      if (s % 2 === 0){
+        ctx.fillStyle = `rgb(${(shade*1.1)|0},${(shade*0.6)|0},${(shade*1.3)|0})`;
+      } else {
+        ctx.fillStyle = `rgb(${(shade*0.8)|0},${(shade*0.5)|0},${(shade*1.0)|0})`;
+      }
+      ctx.fillRect(i*colW, sTopY, colW+1, stripeH+0.5);
+    }
+  } else if (hit.cell === 3){
+    const shade = Math.max(20, 100 - corr*6);
+    ctx.fillStyle = `rgb(${(shade*1.2)|0},${(shade*0.5)|0},${(shade*1.4)|0})`;
+    ctx.fillRect(i*colW, topY, colW+1, wallHpx);
+  } else {
+    const base = hit.side === 1 ? 45 : 65;
+    const shade = Math.max(10, base - corr*6);
+    ctx.fillStyle = `rgb(${(shade*1.0)|0},${(shade*0.55)|0},${(shade*1.25)|0})`;
+    ctx.fillRect(i*colW, topY, colW+1, wallHpx);
+  }
+}
+
+// Z-буфер вынесен наружу
+let zBuffer = null;
+let numRaysCache = 0;
+let colWCache = 0;
+
+function render(){
+  if (transitionActive) {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
+
+  let shakeX = 0, shakeY = 0;
+  if (player.shake > 0.01){
+    shakeX = (Math.random() - 0.5) * player.shake * 20;
+    shakeY = (Math.random() - 0.5) * player.shake * 20;
+  }
+
+  const horizon = H/2 + pitchPixels + Math.sin(player.bob) * 3;
+  const projScale = H * 0.9;
+
+  ctx.save();
+  ctx.translate(shakeX, shakeY);
+
+  const sky = ctx.createLinearGradient(0, 0, 0, horizon);
+  sky.addColorStop(0, '#000000');
+  sky.addColorStop(1, '#08020a');
+  ctx.fillStyle = sky; ctx.fillRect(-50, -50, W+100, horizon+50);
+
+  const flr = ctx.createLinearGradient(0, horizon, 0, H);
+  flr.addColorStop(0, '#050108');
+  flr.addColorStop(1, '#000000');
+  ctx.fillStyle = flr; ctx.fillRect(-50, horizon, W+100, H - horizon + 50);
+
+  const numRays = Math.min(400, Math.floor(W/3));
+  const colW = W / numRays;
+  if (numRays !== numRaysCache){
+    zBuffer = new Float32Array(numRays);
+    numRaysCache = numRays;
+  }
+  colWCache = colW;
+
+  for (let i = 0; i < numRays; i++){
+    const rayAngle = player.dir - FOV/2 + (i/numRays)*FOV;
+    const hit = castRay(player.x, player.y, rayAngle);
+    const corr = hit.dist * Math.cos(rayAngle - player.dir);
+    zBuffer[i] = corr;
+    drawWallStrip(i, colW, horizon, projScale, hit, corr);
+  }
+
+  ctx.restore();
+
+  // Враги — через transform
+  for (let i = 0; i < enemies.length; i++){
+    const e = enemies[i];
+    const el = enemyEls[i];
+    if (!e.alive){ el.style.display = 'none'; continue; }
+    const dx = e.x - player.x, dy = e.y - player.y;
+    const dist = Math.hypot(dx, dy);
+    let a = Math.atan2(dy, dx) - player.dir;
+    while (a >  Math.PI) a -= 2*Math.PI;
+    while (a < -Math.PI) a += 2*Math.PI;
+    if (Math.abs(a) > FOV/2 + 0.3){ el.style.display = 'none'; continue; }
+    const screenX = W/2 + Math.tan(a) * (W/2) / Math.tan(FOV/2);
+    const colIdx = Math.floor(screenX / colW);
+    if (colIdx >= 0 && colIdx < numRays && zBuffer[colIdx] < dist - 0.15){
+      el.style.display = 'none'; continue;
+    }
+    const eh = act2 ? ENEMY_HEIGHT_2 : ENEMY_HEIGHT;
+    const hpx = (eh / Math.max(0.4, dist)) * projScale;
+    const floorY = horizon + (EYE_H / Math.max(0.4, dist)) * projScale;
+    const topY = floorY - hpx;
+    let src;
+    if (e.atkTime > 0){
+      src = 'ataka.gif';
+    } else {
+      let rel = Math.atan2(player.y - e.y, player.x - e.x) - e.facing;
+      while (rel >  Math.PI) rel -= 2*Math.PI;
+      while (rel < -Math.PI) rel += 2*Math.PI;
+      const deg = rel * 180 / Math.PI;
+      if      (deg > -45 && deg <=  45) src = 'vpered.gif';
+      else if (deg >  45 && deg <= 135) src = 'pravi.gif';
+      else if (deg >  135 || deg <= -135) src = 'nazad.gif';
+      else                              src = 'levo.gif';
+    }
+    if (el.dataset.src !== src){ el.src = src; el.dataset.src = src; }
+    const aspect = getAspect(src);
+    const wpx = hpx * aspect;
+    const fade = Math.max(0.35, Math.min(1, 1.6 - dist * 0.10));
+    el.style.display = 'block';
+    el.style.transform = `translate3d(${(screenX - wpx/2 + shakeX).toFixed(1)}px, ${(topY + shakeY).toFixed(1)}px, 0)`;
+    el.style.width  = wpx + 'px';
+    el.style.height = hpx + 'px';
+    if (e.hitFlash > 0){
+      el.style.filter =
+        `brightness(${fade}) brightness(0.45) sepia(1) hue-rotate(255deg) saturate(10) brightness(1.2) ` +
+        `drop-shadow(0 0 10px #a060c0) drop-shadow(0 0 20px #a060c0)`;
+    } else {
+      el.style.filter = `brightness(${fade})`;
+    }
+    el.style.zIndex = 200 - Math.min(100, Math.round(dist * 4));
+  }
+
+  // Ant
+  if (act2 && ant.active && isLoaded(ant.attackAnim > 0 ? 'antaka.gif' : 'ant.gif')) {
+    const dx = ant.x - player.x, dy = ant.y - player.y;
+    const dist = Math.hypot(dx, dy);
+    let a = Math.atan2(dy, dx) - player.dir;
+    while (a >  Math.PI) a -= 2*Math.PI;
+    while (a < -Math.PI) a += 2*Math.PI;
+    if (Math.abs(a) <= FOV/2 + 0.3) {
+      const screenX = W/2 + Math.tan(a) * (W/2) / Math.tan(FOV/2);
+      const colIdx = Math.floor(screenX / colW);
+      let visible = true;
+      if (colIdx >= 0 && colIdx < numRays && zBuffer[colIdx] < dist - 0.15) visible = false;
+      if (visible) {
+        const hpx = (ANT_HEIGHT / Math.max(0.4, dist)) * projScale;
+        const floorY = horizon + (EYE_H / Math.max(0.4, dist)) * projScale;
+        const topY = floorY - hpx;
+        let src = ant.attackAnim > 0 ? 'antaka.gif' : 'ant.gif';
+        if (antEl.dataset.src !== src) { antEl.src = src; antEl.dataset.src = src; }
+        const aspect = getAspect(src);
+        const wpx = hpx * aspect;
+        const fade = Math.max(0.35, Math.min(1, 1.6 - dist * 0.10));
+        antEl.style.display = 'block';
+        antEl.style.transform = `translate3d(${(screenX - wpx/2 + shakeX).toFixed(1)}px, ${(topY + shakeY).toFixed(1)}px, 0)`;
+        antEl.style.width = wpx + 'px';
+        antEl.style.height = hpx + 'px';
+        antEl.style.filter = `brightness(${fade})`;
+        antEl.style.zIndex = 200 - Math.min(100, Math.round(dist * 4));
+      } else {
+        antEl.style.display = 'none';
+      }
+    } else {
+      antEl.style.display = 'none';
+    }
+  } else {
+    if (antEl) antEl.style.display = 'none';
+  }
+
+  if (!act2) {
+    renderBoss(horizon, projScale, shakeX, shakeY);
+    renderBalls(horizon, projScale, zBuffer, colW, numRays, shakeX, shakeY);
+  }
+
+  updateHand(shakeX, shakeY);
+
+  let aimingAny = false;
+  for (const e of enemies){
+    if (e.alive && isAimingAt(e)){ aimingAny = true; break; }
+  }
+  ctx.fillStyle = aimingAny ? '#a060c0' : '#c0b0d0';
+  ctx.beginPath();
+  ctx.arc(W/2, H/2, aimingAny ? 4 : 2.5, 0, Math.PI*2);
+  ctx.fill();
+
+  if (joy.active){
+    ctx.strokeStyle = 'rgba(100,60,120,0.5)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(joy.baseX, joy.baseY, joy.R, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = 'rgba(40,20,60,0.3)';
+    ctx.beginPath(); ctx.arc(joy.baseX, joy.baseY, joy.R, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(180,150,200,0.8)';
+    ctx.beginPath(); ctx.arc(joy.x, joy.y, joy.r, 0, Math.PI*2); ctx.fill();
+  }
+
+  ctx.fillStyle = '#c0b0d0';
+  ctx.font = '14px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('ТЕРПЕНИЕ ' + Math.floor(player.hp), 12, 22);
+
+  if (act2) {
+    if (ant.active) {
+      ctx.fillStyle = '#80ff80';
+      ctx.fillText(`ANT: ${Math.ceil(ant.timer)}c`, 12, 42);
+    } else if (ant.cooldown > 0) {
+      ctx.fillStyle = '#806080';
+      ctx.fillText(`ANT CD: ${Math.ceil(ant.cooldown)}c`, 12, 42);
+    } else {
+      ctx.fillStyle = '#80ff80';
+      ctx.fillText('ANT: ГОТОВ', 12, 42);
+    }
+  }
+
+  if (player.gainTextTimer > 0){
+    ctx.fillStyle = '#a060c0';
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText(player.gainText, 165, 23);
+  }
+
+  if (!act2 && boss.alive && player.y > BOSS_ROOM_Y - 0.5){
+    const barW = Math.min(W * 0.6, 600);
+    const barH = 14;
+    const barX = (W - barW) / 2;
+    const barY = 50;
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(barX - 3, barY - 3, barW + 6, barH + 6);
+    ctx.fillStyle = '#08020a';
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.fillStyle = '#602080';
+    ctx.fillRect(barX, barY, barW * (boss.hp / BOSS_MAX_HP), barH);
+    ctx.fillStyle = '#a090b0';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('БОСС', W/2, barY - 8);
+    ctx.textAlign = 'left';
+  }
+
+  if (player.hp <= 0){
+    ctx.fillStyle = 'rgba(5,0,10,0.85)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#804090'; ctx.font = 'bold 40px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('ТЕРПЕНИЕ ЛОПНУЛО', W/2, H/2);
+    ctx.textAlign = 'left';
+  }
+}
+
+function renderBoss(horizon, projScale, shakeX, shakeY){
+  if (act2 || !boss.alive || player.y < BOSS_ROOM_Y || transitionActive){
+    if (bossEl) bossEl.style.display = 'none';
+    return;
+  }
+  if (!isLoaded('function.gif')){ bossEl.style.display = 'none'; return; }
+  const dx = boss.x - player.x, dy = boss.y - player.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist > 30){ bossEl.style.display = 'none'; return; }
+  let a = Math.atan2(dy, dx) - player.dir;
+  while (a >  Math.PI) a -= 2*Math.PI;
+  while (a < -Math.PI) a += 2*Math.PI;
+  if (Math.abs(a) > FOV/2 + 0.6){ bossEl.style.display = 'none'; return; }
+
+  const screenX = W/2 + Math.tan(a) * (W/2) / Math.tan(FOV/2);
+  const bhpx = ((BOSS_TOP - BOSS_BOTTOM) / Math.max(0.4, dist)) * projScale;
+  const bottomY = horizon + ((EYE_H - BOSS_BOTTOM) / Math.max(0.4, dist)) * projScale;
+  const topY = bottomY - bhpx;
+  const aspect = getAspect('function.gif');
+  const wpx = bhpx * (aspect > 0.1 ? aspect : BOSS_ASPECT);
+
+  bossEl.style.display = 'block';
+  bossEl.style.transform = `translate3d(${(screenX - wpx/2 + shakeX).toFixed(1)}px, ${(topY + shakeY).toFixed(1)}px, 0)`;
+  bossEl.style.width  = wpx + 'px';
+  bossEl.style.height = bhpx + 'px';
+  bossEl.style.zIndex = 50;
+
+  if (boss.hitFlash > 0){
+    bossEl.style.filter =
+      `brightness(0.45) sepia(1) hue-rotate(255deg) saturate(10) brightness(1.2) ` +
+      `drop-shadow(0 0 20px #a060c0) drop-shadow(0 0 40px #a060c0)`;
+  } else {
+    bossEl.style.filter = 'none';
+  }
+}
+
+function renderBalls(horizon, projScale, zBuffer, colW, numRays, shakeX, shakeY){
+  if (transitionActive || !isLoaded('ball.gif')){
+    for (const b of balls) b.el.style.display = 'none';
+    return;
+  }
+  for (const b of balls){
+    if (!b.active){ b.el.style.display = 'none'; continue; }
+    const dx = b.x - player.x, dy = b.y - player.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 30){ b.el.style.display = 'none'; continue; }
+    let a = Math.atan2(dy, dx) - player.dir;
+    while (a >  Math.PI) a -= 2*Math.PI;
+    while (a < -Math.PI) a += 2*Math.PI;
+    if (Math.abs(a) > FOV/2 + 0.3){ b.el.style.display = 'none'; continue; }
+    const screenX = W/2 + Math.tan(a) * (W/2) / Math.tan(FOV/2);
+    const colIdx = Math.floor(screenX / colW);
+    if (colIdx >= 0 && colIdx < numRays && zBuffer[colIdx] < dist - 0.3){
+      b.el.style.display = 'none'; continue;
+    }
+    const bBot = 1.0, bTop = 1.4;
+    const bhpx = ((bTop - bBot) / Math.max(0.4, dist)) * projScale;
+    const bottomY = horizon + ((EYE_H - bBot) / Math.max(0.4, dist)) * projScale;
+    const topY = bottomY - bhpx;
+    let aspect = getAspect('ball.gif');
+    if (aspect < 0.5 || aspect > 2) aspect = 1.0;
+    const wpx = bhpx * aspect;
+    b.el.style.display = 'block';
+    b.el.style.transform = `translate3d(${(screenX - wpx/2 + shakeX).toFixed(1)}px, ${(topY + shakeY).toFixed(1)}px, 0)`;
+    b.el.style.width  = wpx + 'px';
+    b.el.style.height = bhpx + 'px';
+    b.el.style.zIndex = 200 - Math.min(100, Math.round(dist * 4));
+    b.el.style.filter = b.deflected
+      ? 'hue-rotate(240deg) brightness(1.2) drop-shadow(0 0 10px #a060c0)'
+      : 'none';
+  }
+}
+
+// Пауза при скрытой вкладке — не копим dt
+let paused = false;
+document.addEventListener('visibilitychange', () => {
+  paused = document.hidden;
+  last = performance.now();
+});
+
+function loop(now){
+  const dt = Math.min(0.05, (now - last)/1000);
+  last = now;
+  if (!paused){
+    update(dt);
+    render();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
